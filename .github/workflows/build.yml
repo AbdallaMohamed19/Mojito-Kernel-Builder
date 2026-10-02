@@ -1,5 +1,6 @@
 name: Build NetErnels (mojito/sunny) with KernelSU
-
+env:
+  KCFLAGS: "-Wno-error=fortify-source"
 on:
   workflow_dispatch:
     inputs:
