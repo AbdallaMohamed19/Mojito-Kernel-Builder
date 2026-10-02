@@ -287,7 +287,7 @@ jobs:
             )
           fi
 
-          make -j"${PROCS}" "${MAKE_ARGS[@]}" "${DEFCONFIG}"
+          make -j"${PROCS}" "${MAKE_ARGS[@]}" "${DEFCONFIG}" 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
 
           # Make sure the KernelSU options survived the config resolution
           if [ "${KSU_VARIANT}" != "none" ]; then
@@ -300,7 +300,21 @@ jobs:
           fi
 
           # Same targets the NetErnels maintainer uses (Image + dtbo.img)
-          make -j"${PROCS}" "${MAKE_ARGS[@]}" Image dtbo.img 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+          if ! make -j"${PROCS}" "${MAKE_ARGS[@]}" Image dtbo.img 2>&1 | tee -a "${GITHUB_WORKSPACE}/build.log"; then
+            set +e
+            echo "=============================================================="
+            echo " BUILD FAILED - re-running single-threaded to show the real error"
+            echo "=============================================================="
+            make -j1 "${MAKE_ARGS[@]}" Image dtbo.img > "${GITHUB_WORKSPACE}/rerun.log" 2>&1
+            cat "${GITHUB_WORKSPACE}/rerun.log" >> "${GITHUB_WORKSPACE}/build.log"
+
+            echo "----- first error with surrounding lines -----"
+            grep -n -m1 -B12 -A12 -E "error:|\*\*\* \[|Error [0-9]+$" "${GITHUB_WORKSPACE}/rerun.log"
+
+            echo "----- all error lines -----"
+            grep -nE "error:|\*\*\* \[|multiple definition|undefined reference|No such file" "${GITHUB_WORKSPACE}/rerun.log" | head -n 30
+            exit 1
+          fi
 
           DTB="out/arch/arm64/boot/dts/qcom/sm6150.dtb"
           if [ ! -f "${DTB}" ]; then
