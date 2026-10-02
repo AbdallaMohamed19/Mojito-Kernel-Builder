@@ -22,7 +22,7 @@ on:
         options:
           - gcc
           - clang
-        default: clang
+        default: gcc
       ksu_variant:
         description: "KernelSU variant"
         required: true
@@ -242,6 +242,28 @@ jobs:
           grep -E "CONFIG_(KSU|KPROBES|HAVE_KPROBES|KPROBE_EVENTS)=" "arch/arm64/configs/${DEFCONFIG}"
 
       # ------------------------------------------------------------
+      - name: Clang workaround - disable 32-bit vDSO
+        if: ${{ inputs.compiler == 'clang' }}
+        shell: bash
+        working-directory: kernel-source
+        run: |
+          set -e
+
+          # Proton Clang cannot assemble this kernel's 32-bit (compat) vDSO:
+          #   proton-clang/bin/as: unrecognized option '-EL'
+          # Turning the compat vDSO off removes that step (32-bit apps just use the normal syscall path).
+          echo "vDSO related symbols in arch/arm64/Kconfig:"
+          grep -n "VDSO" arch/arm64/Kconfig || true
+
+          if grep -q "COMPAT_VDSO" arch/arm64/Kconfig; then
+            ./scripts/config --file "arch/arm64/configs/${DEFCONFIG}" -d COMPAT_VDSO
+            echo "defconfig now says:"
+            grep -n "COMPAT_VDSO" "arch/arm64/configs/${DEFCONFIG}" || true
+          else
+            echo "WARNING: COMPAT_VDSO symbol not found - the 32-bit vDSO may still fail with clang."
+          fi
+
+      # ------------------------------------------------------------
       - name: Build kernel
         shell: bash
         working-directory: kernel-source
@@ -288,6 +310,15 @@ jobs:
           fi
 
           make -j"${PROCS}" "${MAKE_ARGS[@]}" "${DEFCONFIG}" 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+
+          if [ "${COMPILER}" = "clang" ]; then
+            echo "----- vDSO options in .config -----"
+            grep -n "VDSO" out/.config || true
+            if grep -q "^CONFIG_COMPAT_VDSO=y" out/.config; then
+              echo "ERROR: CONFIG_COMPAT_VDSO is still enabled - Proton Clang cannot build the 32-bit vDSO. Use compiler=gcc."
+              exit 1
+            fi
+          fi
 
           # Make sure the KernelSU options survived the config resolution
           if [ "${KSU_VARIANT}" != "none" ]; then
