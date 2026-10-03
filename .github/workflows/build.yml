@@ -15,6 +15,14 @@ on:
         description: "Defconfig name"
         required: true
         default: "neternels_defconfig"
+      runner:
+        description: "Runner OS (use ubuntu-24.04 if a toolchain tool complains about GLIBC)"
+        required: true
+        type: choice
+        options:
+          - ubuntu-22.04
+          - ubuntu-24.04
+        default: ubuntu-22.04
       compiler:
         description: "Compiler (if the build fails with one, try the other)"
         required: true
@@ -53,7 +61,7 @@ on:
 jobs:
   build:
     name: Build Kernel
-    runs-on: ubuntu-22.04
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 120
 
     env:
@@ -137,6 +145,17 @@ jobs:
               fi
             fi
           done
+          if ! command -v ld.lld >/dev/null 2>&1; then
+            V="$(ls /usr/bin/ld.lld-* 2>/dev/null | sort -V | tail -n1)"
+            if [ -n "$V" ]; then
+              sudo ln -sf "$V" /usr/local/bin/ld.lld
+              echo "linked ld.lld -> $V"
+            else
+              echo "ERROR: ld.lld not found"
+              exit 1
+            fi
+          fi
+          ld.lld --version | head -n1
           echo "LLVM tools OK"
 
       # ------------------------------------------------------------
@@ -189,6 +208,21 @@ jobs:
               mv "${repo}-master" "${dir}"
             done
             ./gcc64/bin/aarch64-elf-gcc --version | head -n1
+
+            echo "---- toolchain sanity check (does each tool run on this runner?) ----"
+            for t in gcc64/bin/aarch64-elf-gcc gcc64/bin/aarch64-elf-as gcc64/bin/aarch64-elf-ld \
+                     gcc64/bin/aarch64-elf-ld.lld gcc32/bin/arm-eabi-gcc gcc32/bin/arm-eabi-as \
+                     gcc32/bin/arm-eabi-ld; do
+              if [ -x "$t" ]; then
+                if "$t" --version > /tmp/ver.txt 2>&1; then
+                  echo "OK    $t : $(head -n1 /tmp/ver.txt)"
+                else
+                  echo "FAIL  $t : $(head -n1 /tmp/ver.txt)"
+                fi
+              else
+                echo "MISS  $t"
+              fi
+            done
           else
             curl -fsSL --retry 5 --retry-delay 5 -o proton.tar.gz \
               "https://github.com/kdrag0n/proton-clang/archive/refs/heads/master.tar.gz"
@@ -304,12 +338,23 @@ jobs:
 
           if [ "${COMPILER}" = "gcc" ]; then
             export PATH="${TC}/gcc32/bin:${TC}/gcc64/bin:/usr/bin:${PATH}"
+
+            # The toolchain's own lld may need a newer glibc than this runner has
+            # (error: version `GLIBC_2.36' not found). Fall back to the system ld.lld.
+            LD_BIN="${TC}/gcc64/bin/aarch64-elf-ld.lld"
+            if ! "${LD_BIN}" --version >/dev/null 2>&1; then
+              echo "Toolchain ld.lld cannot run on this runner - using the system ld.lld instead"
+              LD_BIN="$(command -v ld.lld)"
+            fi
+            echo "Linker: ${LD_BIN}"
+            "${LD_BIN}" --version | head -n1
+
             MAKE_ARGS=(
               ARCH=arm64
               O=out
               CROSS_COMPILE=aarch64-elf-
               CROSS_COMPILE_ARM32=arm-eabi-
-              LD="${TC}/gcc64/bin/aarch64-elf-ld.lld"
+              LD="${LD_BIN}"
               AR=llvm-ar
               NM=llvm-nm
               OBJDUMP=llvm-objdump
