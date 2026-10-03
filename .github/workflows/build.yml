@@ -1,4 +1,4 @@
-name: Build NetErnels (mojito/sunny) with KernelSU
+Name: Build NetErnels (mojito/sunny) with KernelSU
 
 on:
   workflow_dispatch:
@@ -392,7 +392,12 @@ jobs:
             )
           fi
 
+          # Prepare defconfig
           make -j"${PROCS}" "${MAKE_ARGS[@]}" "${DEFCONFIG}" 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+
+          # Pre-generate SELinux headers (flask.h & av_permissions.h) to fix KernelSU missing header errors
+          echo "=== Generating SELinux headers to fix flask.h missing error ==="
+          make -j"${PROCS}" "${MAKE_ARGS[@]}" security/selinux/flask.h 2>&1 | tee -a "${GITHUB_WORKSPACE}/build.log" || true
 
           if [ "${COMPILER}" = "clang" ]; then
             echo "----- vDSO options in .config (fix mode: ${VDSO32_FIX}) -----"
@@ -507,87 +512,3 @@ jobs:
           READ_AHEAD=@READ_AHEAD@
           TOP_APP_BOOST=@TOP_APP_BOOST@
           LOG=/data/local/tmp/mojito_perf.log
-
-          # wait until Android finished booting, then let everything settle
-          while [ "$(getprop sys.boot_completed)" != "1" ]; do
-            sleep 2
-          done
-          sleep 20
-
-          echo "=== mojito perf tweaks: $(date) ===" > "$LOG"
-
-          # write helper: only touches files that exist and are writable
-          w() {
-            if [ -w "$1" ]; then
-              if echo "$2" > "$1" 2>/dev/null; then
-                echo "ok   $1 = $2" >> "$LOG"
-              else
-                echo "fail $1 = $2" >> "$LOG"
-              fi
-            else
-              echo "skip $1 (missing)" >> "$LOG"
-            fi
-          }
-
-          # 1) storage read-ahead (internal devices only, never USB drives)
-          if [ "$READ_AHEAD" -gt 0 ]; then
-            for dev in /sys/block/*; do
-              name="${dev##*/}"
-              case "$name" in
-                loop*|ram*|zram*) continue ;;
-              esac
-              case "$(readlink -f "$dev" 2>/dev/null)" in
-                *usb*) continue ;;
-              esac
-              w "$dev/queue/read_ahead_kb" "$READ_AHEAD"
-            done
-          fi
-
-          # 2) CPU governor: schedutil on both clusters (little = cpu0, big = cpu6), if the kernel offers it
-          for c in 0 6; do
-            p="/sys/devices/system/cpu/cpu$c/cpufreq"
-            if grep -qw schedutil "$p/scaling_available_governors" 2>/dev/null; then
-              w "$p/scaling_governor" schedutil
-            else
-              echo "skip cpu$c: schedutil not available" >> "$LOG"
-            fi
-          done
-
-          # 3) foreground app responsiveness
-          if [ "$TOP_APP_BOOST" -gt 0 ]; then
-            w /dev/stune/top-app/schedtune.boost "$TOP_APP_BOOST"
-            w /dev/stune/top-app/schedtune.prefer_idle 1
-          fi
-
-          echo "done" >> "$LOG"
-          SERVICE_EOF
-
-          sed -i "s|@READ_AHEAD@|${READ_AHEAD_KB}|; s|@TOP_APP_BOOST@|${TOP_APP_BOOST}|" perf-module/service.sh
-          chmod 755 perf-module/service.sh
-
-          (cd perf-module && zip -r9 "${GITHUB_WORKSPACE}/Mojito-Perf-Tweaks.zip" .)
-          ls -lh Mojito-Perf-Tweaks.zip
-
-      # ------------------------------------------------------------
-      - name: Upload kernel zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: NetErnels-mojito-KSU
-          if-no-files-found: error
-          path: NetErnels-mojito*.zip
-
-      - name: Upload performance module
-        if: ${{ inputs.perf_module }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: Mojito-Perf-Tweaks-Module
-          if-no-files-found: error
-          path: Mojito-Perf-Tweaks.zip
-
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-build-log
-          if-no-files-found: ignore
-          path: build.log
