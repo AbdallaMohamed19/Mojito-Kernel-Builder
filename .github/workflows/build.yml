@@ -128,6 +128,14 @@ jobs:
             zip \
             zlib1g-dev
 
+          # This kernel builds dtbo.img with a script that calls "python2"
+          sudo apt-get install -y python2 || true
+          if ! command -v python2 >/dev/null 2>&1; then
+            echo "python2 package not available - falling back to python3"
+            sudo ln -sf "$(command -v python3)" /usr/local/bin/python2
+          fi
+          python2 --version || true
+
       # ------------------------------------------------------------
       - name: Check LLVM tools
         shell: bash
@@ -402,6 +410,17 @@ jobs:
               || { echo "ERROR: CONFIG_KSU is not enabled"; grep -i ksu out/.config; exit 1; }
             grep -E "^CONFIG_KPROBES=y" out/.config \
               || { echo "ERROR: CONFIG_KPROBES is not enabled"; grep -i kprobe out/.config; exit 1; }
+          fi
+
+          # KernelSU-Next (legacy) patches kernel headers/sources (seccomp.h, selinux, namespace.c ...)
+          # while the build is already running. Objects compiled before that moment would use an
+          # older struct layout than the rest of the kernel. So let it patch first, in a small
+          # pre-pass; the real build below then rebuilds everything that depends on those files.
+          if [ "${KSU_VARIANT}" = "next-legacy" ]; then
+            echo "=== Pre-pass: let KernelSU-Next apply its source patches ==="
+            make -j"${PROCS}" "${MAKE_ARGS[@]}" drivers/kernelsu/ 2>&1 | tee -a "${GITHUB_WORKSPACE}/build.log" || true
+            echo "--- files modified in the kernel tree by the patches ---"
+            git status --short | grep -v '^??' | head -n 30 || true
           fi
 
           # Same targets the NetErnels maintainer uses (Image + dtbo.img)
