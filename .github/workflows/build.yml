@@ -89,7 +89,7 @@ jobs:
           REPO="${KERNEL_REPO#https://github.com/}"
           REPO="${REPO%.git}"
           echo "Branches of ${REPO}, newest commit first:"
-          gh api "repos/${REPO}/branches?per_page=100" --jq '.[].name' | while read -r b; do
+          gh api "repos/${REPO}/branches?per_page=100" --jq '.[].name' | head -n 40 | while read -r b; do
             d="$(gh api "repos/${REPO}/commits/${b}" --jq '.commit.committer.date' 2>/dev/null)"
             echo "${d}  ${b}"
           done | sort -r | head -n 20
@@ -111,6 +111,8 @@ jobs:
             flex \
             gcc-aarch64-linux-gnu \
             gcc-arm-linux-gnueabi \
+            binutils-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu \
             git \
             libelf-dev \
             libncurses-dev \
@@ -236,6 +238,7 @@ jobs:
               "https://github.com/kdrag0n/proton-clang/archive/refs/heads/master.tar.gz"
             tar -xzf proton.tar.gz
             mv proton-clang-master proton-clang
+            rm -f proton.tar.gz
             ./proton-clang/bin/clang --version | head -n1
           fi
 
@@ -297,6 +300,9 @@ jobs:
           # Upstream fix: arm64: vdso32: Fix '--prefix=' value for newer versions of clang.
           MK=arch/arm64/kernel/vdso32/Makefile
 
+          echo "----- current --prefix lines in ${MK} -----"
+          grep -n -- "--prefix=\|elfedit" "$MK" || true
+
           cat > /tmp/patch_vdso32.py <<'PY_EOF'
           import re, sys
           p = sys.argv[1]
@@ -316,6 +322,7 @@ jobs:
           FIX="disable"
           if [ -f "$MK" ] && python3 /tmp/patch_vdso32.py "$MK"; then
             FIX="patch"
+            echo "----- after patch -----"
             grep -n -- "--prefix=" "$MK"
           fi
 
@@ -371,7 +378,7 @@ jobs:
               STRIP=llvm-strip
               HOSTAR=llvm-ar
               HOSTCC=gcc
-              HOSTCXX=aarch64-elf-g++
+              HOSTCXX=g++
               CC=aarch64-elf-gcc
             )
           else
@@ -382,6 +389,7 @@ jobs:
               CROSS_COMPILE=aarch64-linux-gnu-
               CROSS_COMPILE_ARM32=arm-linux-gnueabi-
               CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+              CLANG_TRIPLE=aarch64-linux-gnu-
               LD=ld.lld
               AR=llvm-ar
               AS=llvm-as
@@ -395,7 +403,23 @@ jobs:
           make -j"${PROCS}" "${MAKE_ARGS[@]}" "${DEFCONFIG}" 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
 
           if [ "${COMPILER}" = "clang" ]; then
-            echo "----- vDSO options in .config (fix mode: ${VDSO32_FIX}) -----"
+            echo "----- clang diagnostics -----"
+            command -v arm-linux-gnueabi-elfedit || echo "arm-linux-gnueabi-elfedit not found in PATH"
+            ls "${TC}/proton-clang/bin" | grep -E '^arm-linux-gnueabi-(as|ld)$' || true
+
+            # Safety net: run the "prepare" stage first - it is the one that builds the 32-bit vDSO
+            # headers (where the '-EL' assembler error happens). If it fails for any reason, switch the
+            # 32-bit vDSO off and regenerate the config so the build can still finish.
+            echo "----- pre-flight: prepare stage (32-bit vDSO) -----"
+            if ! make -j"${PROCS}" "${MAKE_ARGS[@]}" prepare 2>&1 | tee -a "${GITHUB_WORKSPACE}/build.log"; then
+              echo "WARNING: prepare failed - disabling CONFIG_COMPAT_VDSO and regenerating the config"
+              ./scripts/config --file "arch/arm64/configs/${DEFCONFIG}" -d COMPAT_VDSO
+              rm -rf out
+              make -j"${PROCS}" "${MAKE_ARGS[@]}" "${DEFCONFIG}" 2>&1 | tee -a "${GITHUB_WORKSPACE}/build.log"
+              VDSO32_FIX="disable"
+            fi
+
+            echo "----- vDSO options in .config (fix mode: ${VDSO32_FIX:-none}) -----"
             grep -n "VDSO" out/.config || true
             if [ "${VDSO32_FIX}" = "disable" ] && grep -q "^CONFIG_COMPAT_VDSO=y" out/.config; then
               echo "ERROR: CONFIG_COMPAT_VDSO is still enabled - Proton Clang cannot build the 32-bit vDSO. Use compiler=gcc."
