@@ -16,13 +16,13 @@ on:
         required: true
         default: "neternels_defconfig"
       runner:
-        description: "Runner OS (use ubuntu-24.04 if a toolchain tool complains about GLIBC)"
+        description: "Runner OS (ubuntu-24.04 recommended; 22.04 has a real python2 but an older glibc)"
         required: true
         type: choice
         options:
-          - ubuntu-22.04
           - ubuntu-24.04
-        default: ubuntu-22.04
+          - ubuntu-22.04
+        default: ubuntu-24.04
       compiler:
         description: "Compiler (if the build fails with one, try the other)"
         required: true
@@ -181,11 +181,9 @@ jobs:
           set -eo pipefail
 
           if [ "${KSU_VARIANT}" = "next-legacy" ]; then
-            # KernelSU-Next: maintained fork that still supports non-GKI (4.14) kernels
             SETUP_URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
             SETUP_ARG="${KSU_REF:-legacy}"
           else
-            # Official KernelSU: v0.9.5 is the last release that supports non-GKI kernels
             SETUP_URL="https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh"
             SETUP_ARG="v0.9.5"
           fi
@@ -211,8 +209,7 @@ jobs:
         working-directory: kernel-source
         run: |
           set -e
-          # dtbo.img is built by an old python2 script. ubuntu-24.04 has no python2 package, so
-          # python2 is really python3 there and the script dies with: name 'xrange' is not defined.
+          # dtbo.img uses an old python2 script; ubuntu-24.04 has no python2 (it becomes python3 -> 'xrange' error)
           PYV="$(python2 --version 2>&1 || true)"
           echo "python2 -> ${PYV}"
           case "${PYV}" in "Python 2."*) echo "real Python 2, nothing to patch"; exit 0 ;; esac
@@ -292,6 +289,17 @@ jobs:
           if [ "${COMPILER}" = "gcc" ]; then
             export PATH="${TC}/gcc32/bin:${TC}/gcc64/bin:/usr/bin:${PATH}"
 
+            # The toolchain's llvm-ar / llvm-objcopy / ld.lld may need glibc 2.36, but ubuntu-22.04 has
+            # 2.35 ("llvm-ar: version GLIBC_2.36 not found"). For every tool use the first copy that runs.
+            pick_tool() {
+              local c
+              for c in "$(command -v "$1" 2>/dev/null)" "/usr/local/bin/$1" "/usr/bin/$1" $(ls /usr/bin/$1-* 2>/dev/null | sort -V -r); do
+                if [ -n "$c" ] && [ -x "$c" ] && "$c" --version >/dev/null 2>&1; then echo "$c"; return 0; fi
+              done
+              echo "ERROR: no working $1 found" >&2
+              return 1
+            }
+
             if ! aarch64-elf-gcc --version >/dev/null 2>&1; then
               echo "ERROR: aarch64-elf-gcc cannot run on this runner (GLIBC?). Re-run with runner=ubuntu-24.04."
               aarch64-elf-gcc --version || true
@@ -299,19 +307,17 @@ jobs:
             fi
             aarch64-elf-gcc --version | head -n1
 
-            # The toolchain's own lld may need a newer glibc than the runner has.
-            # Fall back to a working system ld.lld (never "command -v": PATH starts with the toolchain).
+            AR_BIN="$(pick_tool llvm-ar)"
+            NM_BIN="$(pick_tool llvm-nm)"
+            OBJDUMP_BIN="$(pick_tool llvm-objdump)"
+            OBJCOPY_BIN="$(pick_tool llvm-objcopy)"
+            SIZE_BIN="$(pick_tool llvm-size)"
+            STRIP_BIN="$(pick_tool llvm-strip)"
             LD_BIN="${TC}/gcc64/bin/aarch64-elf-ld.lld"
-            if ! "${LD_BIN}" --version >/dev/null 2>&1; then
-              echo "Toolchain ld.lld cannot run here - using the system one"
-              LD_BIN=""
-              for c in /usr/local/bin/ld.lld /usr/bin/ld.lld $(ls /usr/bin/ld.lld-* 2>/dev/null | sort -V -r); do
-                if [ -x "$c" ] && "$c" --version >/dev/null 2>&1; then LD_BIN="$c"; break; fi
-              done
-              [ -n "${LD_BIN}" ] || { echo "ERROR: no working ld.lld found"; exit 1; }
-            fi
-            echo "Linker: ${LD_BIN}"
-            "${LD_BIN}" --version | head -n1
+            "${LD_BIN}" --version >/dev/null 2>&1 || LD_BIN="$(pick_tool ld.lld)"
+            echo "ar=${AR_BIN} nm=${NM_BIN} objdump=${OBJDUMP_BIN}"
+            echo "objcopy=${OBJCOPY_BIN} size=${SIZE_BIN} strip=${STRIP_BIN}"
+            echo "ld=${LD_BIN} ($("${LD_BIN}" --version | head -n1))"
 
             MAKE_ARGS=(
               ARCH=arm64
@@ -319,13 +325,13 @@ jobs:
               CROSS_COMPILE=aarch64-elf-
               CROSS_COMPILE_ARM32=arm-eabi-
               LD="${LD_BIN}"
-              AR=llvm-ar
-              NM=llvm-nm
-              OBJDUMP=llvm-objdump
-              OBJCOPY=llvm-objcopy
-              OBJSIZE=llvm-size
-              STRIP=llvm-strip
-              HOSTAR=llvm-ar
+              AR="${AR_BIN}"
+              NM="${NM_BIN}"
+              OBJDUMP="${OBJDUMP_BIN}"
+              OBJCOPY="${OBJCOPY_BIN}"
+              OBJSIZE="${SIZE_BIN}"
+              STRIP="${STRIP_BIN}"
+              HOSTAR="${AR_BIN}"
               HOSTCC=gcc
               HOSTCXX=g++
               CC=aarch64-elf-gcc
