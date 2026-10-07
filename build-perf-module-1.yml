@@ -1,0 +1,118 @@
+name: Build Mojito Perf Tweaks module (KernelSU / Magisk)
+
+on:
+  workflow_dispatch:
+    inputs:
+      read_ahead_kb:
+        description: "Read-ahead for internal storage in KB (0 = skip)"
+        required: false
+        default: "512"
+      top_app_boost:
+        description: "Schedtune boost for the foreground app (0 = skip, higher = smoother but more battery)"
+        required: false
+        default: "10"
+
+jobs:
+  module:
+    name: Build module
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    env:
+      READ_AHEAD_KB: ${{ inputs.read_ahead_kb }}
+      TOP_APP_BOOST: ${{ inputs.top_app_boost }}
+
+    steps:
+      - name: Build performance module
+        shell: bash
+        run: |
+          set -e
+
+          case "${READ_AHEAD_KB}" in ''|*[!0-9]*) echo "ERROR: read_ahead_kb must be a number"; exit 1 ;; esac
+          case "${TOP_APP_BOOST}" in ''|*[!0-9]*) echo "ERROR: top_app_boost must be a number"; exit 1 ;; esac
+
+          mkdir -p perf-module
+
+          cat > perf-module/module.prop <<PROP_EOF
+          id=mojito_perf_tweaks
+          name=Mojito Perf Tweaks
+          version=v$(date +%Y%m%d)
+          versionCode=$(date +%Y%m%d)
+          author=Abdalla
+          description=Runtime tweaks for Redmi Note 10 (mojito/sunny): storage read-ahead, CPU governor, foreground boost.
+          PROP_EOF
+
+          cat > perf-module/service.sh <<'SERVICE_EOF'
+          #!/system/bin/sh
+          # Mojito perf tweaks - runs in late_start service mode (KernelSU / Magisk)
+
+          READ_AHEAD=@READ_AHEAD@
+          TOP_APP_BOOST=@TOP_APP_BOOST@
+          LOG=/data/local/tmp/mojito_perf.log
+
+          # wait until Android finished booting, then let everything settle
+          while [ "$(getprop sys.boot_completed)" != "1" ]; do
+            sleep 2
+          done
+          sleep 20
+
+          echo "=== mojito perf tweaks: $(date) ===" > "$LOG"
+
+          # write helper: only touches files that exist and are writable
+          w() {
+            if [ -w "$1" ]; then
+              if echo "$2" > "$1" 2>/dev/null; then
+                echo "ok   $1 = $2" >> "$LOG"
+              else
+                echo "fail $1 = $2" >> "$LOG"
+              fi
+            else
+              echo "skip $1 (missing)" >> "$LOG"
+            fi
+          }
+
+          # 1) storage read-ahead (internal devices only, never USB drives)
+          if [ "$READ_AHEAD" -gt 0 ]; then
+            for dev in /sys/block/*; do
+              name="${dev##*/}"
+              case "$name" in
+                loop*|ram*|zram*) continue ;;
+              esac
+              case "$(readlink -f "$dev" 2>/dev/null)" in
+                *usb*) continue ;;
+              esac
+              w "$dev/queue/read_ahead_kb" "$READ_AHEAD"
+            done
+          fi
+
+          # 2) CPU governor: schedutil on both clusters (little = cpu0, big = cpu6), if the kernel offers it
+          for c in 0 6; do
+            p="/sys/devices/system/cpu/cpu$c/cpufreq"
+            if grep -qw schedutil "$p/scaling_available_governors" 2>/dev/null; then
+              w "$p/scaling_governor" schedutil
+            else
+              echo "skip cpu$c: schedutil not available" >> "$LOG"
+            fi
+          done
+
+          # 3) foreground app responsiveness
+          if [ "$TOP_APP_BOOST" -gt 0 ]; then
+            w /dev/stune/top-app/schedtune.boost "$TOP_APP_BOOST"
+            w /dev/stune/top-app/schedtune.prefer_idle 1
+          fi
+
+          echo "done" >> "$LOG"
+          SERVICE_EOF
+
+          sed -i "s|@READ_AHEAD@|${READ_AHEAD_KB}|; s|@TOP_APP_BOOST@|${TOP_APP_BOOST}|" perf-module/service.sh
+          chmod 755 perf-module/service.sh
+
+          (cd perf-module && zip -r9 "${GITHUB_WORKSPACE}/Mojito-Perf-Tweaks.zip" .)
+          ls -lh Mojito-Perf-Tweaks.zip
+
+      - name: Upload performance module
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mojito-Perf-Tweaks-Module
+          if-no-files-found: error
+          path: Mojito-Perf-Tweaks.zip
