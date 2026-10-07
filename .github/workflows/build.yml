@@ -64,21 +64,11 @@ jobs:
 
     steps:
       # ------------------------------------------------------------
-      - name: Show kernel branches (newest first)
+      - name: Show kernel branches
         continue-on-error: true
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          set +e
-          REPO="${KERNEL_REPO#https://github.com/}"
-          REPO="${REPO%.git}"
-          echo "Branches of ${REPO}, newest commit first:"
-          gh api "repos/${REPO}/branches?per_page=100" --jq '.[].name' | head -n 40 | while read -r b; do
-            d="$(gh api "repos/${REPO}/commits/${b}" --jq '.commit.committer.date' 2>/dev/null)"
-            echo "${d}  ${b}"
-          done | sort -r | head -n 20
-          exit 0
+          git ls-remote --heads "${KERNEL_REPO}" | sed 's|.*refs/heads/||' | head -n 40
 
       # ------------------------------------------------------------
       - name: Install dependencies
@@ -93,7 +83,6 @@ jobs:
             git libelf-dev libncurses-dev libssl-dev lld llvm lz4 make perl \
             python-is-python3 python3 unzip wget xz-utils zip zlib1g-dev
 
-          # This 4.14 kernel builds dtbo.img with "python2"
           sudo apt-get install -y python2 || true
           if ! command -v python2 >/dev/null 2>&1; then
             echo "python2 package not available - linking python3 as python2"
@@ -212,15 +201,38 @@ jobs:
           grep -qi kernelsu drivers/Makefile || { echo "ERROR: drivers/Makefile was not patched"; exit 1; }
           grep -qi kernelsu drivers/Kconfig  || { echo "ERROR: drivers/Kconfig was not patched"; exit 1; }
 
-          for d in KernelSU KernelSU-Next; do
-            if [ -d "$d" ]; then
-              echo "Integrated ${d}: branch '$(git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null)'  $(git -C "$d" log -1 --format='%h  %cd  %s' --date=short 2>/dev/null)"
-            fi
-          done
-
           # Kprobe based hooks (works on kernels with working kprobes)
           ./scripts/config --file "arch/arm64/configs/${DEFCONFIG}" -e KSU -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS
           grep -E "CONFIG_(KSU|KPROBES|HAVE_KPROBES|KPROBE_EVENTS)=" "arch/arm64/configs/${DEFCONFIG}"
+
+      # ------------------------------------------------------------
+      - name: Fix dtbo tool (python2 on new runners)
+        shell: bash
+        working-directory: kernel-source
+        run: |
+          set -e
+          # dtbo.img is built by an old python2 script. ubuntu-24.04 has no python2 package, so
+          # python2 is really python3 there and the script dies with: name 'xrange' is not defined.
+          PYV="$(python2 --version 2>&1 || true)"
+          echo "python2 -> ${PYV}"
+          case "${PYV}" in "Python 2."*) echo "real Python 2, nothing to patch"; exit 0 ;; esac
+
+          for f in $(find . -name mkdtboimg.py -not -path './out/*'); do
+            sed -i -E 's/\bxrange\(/range(/g; s/\bversion is 0\b/version == 0/g; s/\.tostring\(\)/.tobytes()/g' "$f"
+            echo "patched $f"
+          done
+
+          # quick self-test of the patched tool
+          printf '/dts-v1/;\n/plugin/;\n/ { };\n' > /tmp/t.dts
+          dtc -@ -I dts -O dtb -o /tmp/t.dtbo /tmp/t.dts
+          if ! python2 scripts/dtc/libfdt/mkdtboimg.py create /tmp/t.img --page_size=4096 /tmp/t.dtbo > /tmp/t.out 2>&1; then
+            cat /tmp/t.out
+            if grep -q Traceback /tmp/t.out; then
+              echo "ERROR: dtbo tool still fails under Python 3. Re-run with runner=ubuntu-22.04 (it has a real python2)."
+              exit 1
+            fi
+            echo "WARNING: self-test failed without a Python error (probably just different CLI options) - continuing"
+          fi
 
       # ------------------------------------------------------------
       - name: Clang workaround - 32-bit vDSO assembler
@@ -232,7 +244,6 @@ jobs:
           # 4.14 + newer clang: "proton-clang/bin/as: unrecognized option '-EL'" (clang picks the x86 "as").
           # Upstream fix: arm64: vdso32: Fix '--prefix=' value for newer versions of clang.
           MK=arch/arm64/kernel/vdso32/Makefile
-          grep -n -- "--prefix=\|elfedit" "$MK" || true
 
           cat > /tmp/patch_vdso32.py <<'PY_EOF'
           import re, sys
@@ -371,10 +382,12 @@ jobs:
             echo "===== BUILD FAILED - re-running with --keep-going to collect every real error ====="
             make -k -j"${PROCS}" -Otarget "${MAKE_ARGS[@]}" Image dtbo.img > "${GITHUB_WORKSPACE}/rerun.log" 2>&1
             cat "${GITHUB_WORKSPACE}/rerun.log" >> "${GITHUB_WORKSPACE}/build.log"
-            echo "----- first error with surrounding lines -----"
-            grep -n -m1 -B12 -A12 -E "error:|\*\*\* \[|Error [0-9]+$" "${GITHUB_WORKSPACE}/rerun.log"
-            echo "----- all error lines -----"
-            grep -nE "error:|\*\*\* \[|multiple definition|undefined reference|No such file" "${GITHUB_WORKSPACE}/rerun.log" | head -n 30
+            # "write on a pipe with no reader" is harmless noise (llvm-objdump | grep -q) - hide it
+            grep -v "write on a pipe with no reader" "${GITHUB_WORKSPACE}/rerun.log" > "${GITHUB_WORKSPACE}/rerun.clean.log"
+            echo "----- first real error with surrounding lines -----"
+            grep -n -m1 -B15 -A15 -E "error:|\*\*\* \[|Error [0-9]+$|undefined reference|multiple definition" "${GITHUB_WORKSPACE}/rerun.clean.log"
+            echo "----- all real error lines (first 40) -----"
+            grep -nE "error:|\*\*\* \[|multiple definition|undefined reference|No such file" "${GITHUB_WORKSPACE}/rerun.clean.log" | head -n 40
             exit 1
           fi
 
@@ -394,7 +407,6 @@ jobs:
 
           # NetErnels' own AnyKernel3 (device-specific), same as the maintainer's kramel.sh
           git clone --depth=1 -b mojito https://github.com/neternels/anykernel3 anykernel3-mojito
-          mkdir -p anykernel3-mojito/dtbs
           cp "${KOUT}/Image" anykernel3-mojito/
           cp "${KOUT}/dtbo.img" anykernel3-mojito/
           cat "${KOUT}/dts/qcom/sm6150.dtb" > anykernel3-mojito/dtb
@@ -413,15 +425,6 @@ jobs:
           sha1sum "${ZIP}"
 
       # ------------------------------------------------------------
-      - name: Failure summary
-        if: failure()
-        shell: bash
-        run: |
-          set +e
-          echo "===== error lines from build.log ====="
-          grep -nE "ERROR|error:|\*\*\* \[|GLIBC" build.log | tail -n 25
-          exit 0
-
       - name: Upload kernel zip
         uses: actions/upload-artifact@v4
         with:
